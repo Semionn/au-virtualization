@@ -14,12 +14,13 @@
 #include <sys/syscall.h>
 #include <fcntl.h>
 #include <thread>
+#include <arpa/inet.h>
 #include "common.h"
 #include "cont_list.h"
 
 using namespace std;
 
-const char *CONT_HOSTNAME = "container";
+const char* CONT_HOSTNAME = "container";
 
 #define STACK_SIZE (1024 * 1024)
 static char container_stack[STACK_SIZE];
@@ -32,9 +33,54 @@ public:
     string image_path = "";
     string cmd = "";
     vector<char *> args;
+    string net = "";
+    string net_id = "";
 
     int pipe_fd[2];
 };
+
+char* next_addr(string address_string) {
+    in_addr_t address = inet_addr(address_string.c_str());
+
+    address = htonl(ntohl(address) + 1);
+
+    struct in_addr address_struct;
+    address_struct.s_addr = address;
+    return inet_ntoa(address_struct);
+}
+
+void config_host_net(Arguments *args) {
+    if (args->net != "") {
+        int pid = args->pid;
+        string net_id = args->net_id;
+
+        string cmd = "sudo ip link add name u-" + net_id +"-0 type veth peer name u-" + net_id + "-1";
+        check_res(system(cmd.c_str()), "ip link add");
+
+        cmd = "sudo ip link set u-" + net_id + "-1 netns " + to_string(pid);
+        check_res(system(cmd.c_str()), "ip link set");
+
+        cmd = "sudo ip link set u-" + net_id + "-0 up";
+        check_res(system(cmd.c_str()), "ip link set");
+
+        string next_ip = next_addr(args->net);
+        cmd = "sudo ip addr add " + next_ip + "/24 dev u-" + net_id + "-0";
+        check_res(system(cmd.c_str()), "ip set");
+    }
+
+}
+
+void config_cont_net(Arguments *args) {
+    if (args->net != "") {
+        check_res(system("ip link set lo up"), "set lo");
+        string com = "ip link set u-" + args->net_id + "-1 up";
+        check_res(system(com.c_str()), "ip link up");
+
+        string host_ip = args->net;
+        com = string("ip addr add ") + host_ip + "/24 dev u-" + args->net_id + "-1";
+        check_res(system(com.c_str()), "ip up");
+    }
+}
 
 int container_main(void *arg) {
     Arguments *args = (Arguments *) arg;
@@ -67,12 +113,6 @@ int container_main(void *arg) {
     check_res(mount("tmpfs", "dev/shm", "tmpfs", MS_NOSUID | MS_NODEV | MS_STRICTATIME, "mode=1777"),
                  "mount /dev/shm");
 
-    struct stat sb;
-    if (stat("/dev/mqueue", &sb) == 0 && S_ISDIR(sb.st_mode)) {
-        mkdir("dev/mqueue", 0755);
-        check_res(mount("/dev/mqueue", "dev/mqueue", NULL, MS_BIND, NULL), "mount /dev/mqueue");
-    }
-
     string new_root_path = args->image_path;
     string old_root_path = args->image_path + "/old";
     mkdir("./old", 0777);
@@ -88,10 +128,17 @@ int container_main(void *arg) {
 
     check_res(sethostname(CONT_HOSTNAME, strlen(CONT_HOSTNAME)), "sethostname");
 
+    umask(0);
+
+    check_res(setsid(), "setsid");
+
+    config_cont_net(args);
+
     if (args->daemonize) {
         freopen("/dev/null", "r", stdin);
         freopen("/tmp/err", "w", stdout);
         freopen("/dev/null", "w", stderr);
+        check_res(chdir("/"), "chdir");
     }
 
     execv(args->cmd.c_str(), &args->args[0]);
@@ -104,6 +151,7 @@ int main(int argc, char *argv[]) {
     const int uid = getuid();
 
     Arguments *args = new Arguments();
+    args->net_id = "Net" + to_string(getpid());
 
     for (int i = 1; i < argc; ++i) {
         string cur = argv[i];
@@ -111,6 +159,8 @@ int main(int argc, char *argv[]) {
             args->daemonize = true;
         } else if (cur == "--cpu") {
             args->cpu_perc = atoi(argv[++i]);
+        } else if (cur == "--net") {
+            args->net = argv[++i];
         } else if (args->image_path.empty()) {
             args->image_path = cur;
         } else if (args->cmd.empty()) {
@@ -138,9 +188,25 @@ int main(int argc, char *argv[]) {
 
     int mappid = pid;
     set_uid_map(mappid, 0, uid, 1);
-    string cmd11 = "echo deny >> /proc/" + to_string(mappid) + "/setgroups";
-    system(cmd11.c_str());
+    string cmd1 = "echo deny >> /proc/" + to_string(mappid) + "/setgroups";
+    system(cmd1.c_str());
     set_gid_map(mappid, 0, gid, 1);
+
+    const string cpu_cg_path = "/tmp/cgroup/cpu/" + to_string(pid);
+
+    const string cmd = "mkdir -p " + cpu_cg_path;
+    check_res(system(cmd.c_str()), "system call mkdir ");
+    string chcmd = "chown -R " + std::to_string(getuid()) + ":" + std::to_string(getgid()) + " " + cpu_cg_path;
+    check_res(system(chcmd.c_str()), "chown");
+
+    const string set_period = "echo 1000000 >> " + cpu_cg_path + "/cpu.cfs_period_us";
+    check_res(system(set_period.c_str()), "echo period");
+
+    int quota = 1000000 * args->cpu_perc * thread::hardware_concurrency() / 100;
+    const string set_quota = "echo " + to_string(quota) + " >> " + cpu_cg_path + "/cpu.cfs_quota_us";
+    check_res(system(set_quota.c_str()), "echo quota");
+
+    config_host_net(args);
 
     cout << pid << endl;
     ofstream f(CONT_LIST_FILE, ofstream::app | ofstream::out);

@@ -20,10 +20,12 @@ int main(int argc, char *argv[]) {
 
     pipe(pipe_fd);
 
-    const int gid = getgid(), uid = getuid();
-    string root_path = "/proc/" + to_string(pid) + "/root";
-    int fd = open(root_path.c_str(), O_RDONLY);
-    check_res(fchdir(fd), "fchdir");
+    string cgroup_base_dir = "/tmp/cgroup";
+    string system_path = cgroup_base_dir + "/cpu";
+    string cg_path = system_path + "/" + to_string(pid);
+
+    string s3 = "echo " + to_string(getpid()) + " >> " + cg_path + "/tasks";
+    check_res(system(s3.c_str()), "echo tasks");
 
     vector<string> nsnames = {"user", "uts", "ipc", "net", "pid", "mnt"};
     for (string &ns_name : nsnames) {
@@ -34,10 +36,10 @@ int main(int argc, char *argv[]) {
         check_res(close(ns_fd), "ns close");
     }
 
-    check_res(chroot("."), "chroot");
     check_res(chdir("/bin"), "chdir");
 
     int child_pid = fork();
+    check_res(chdir("/"), "chdir");
     if (child_pid == 0) {
         setgroups(0, NULL);
         setgid(0);
